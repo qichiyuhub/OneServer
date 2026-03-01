@@ -194,9 +194,9 @@ else
         fi
     else
         log "CYAN" "最新可用版本: ${LATEST_VERSION}"
-        compare_versions "$CURRENT_VERSION" "$LATEST_VERSION"
+        compare_versions "$CURRENT_VERSION" "$LATEST_VERSION" && cmp_result=0 || cmp_result=$?
         
-        case $? in
+        case $cmp_result in
             2)
                 log "YELLOW" "发现新版本！"
                 if ! ask_yes_no "是否从 ${CURRENT_VERSION} 升级到 ${LATEST_VERSION}?" "y"; then
@@ -263,6 +263,17 @@ backup_path="/usr/bin/caddy.bak.${backup_date}"
 [[ -f /usr/bin/caddy ]] && run_command "备份旧的 Caddy 二进制文件" sudo mv /usr/bin/caddy "$backup_path"
 run_command "安装新的 Caddy 二进制文件" sudo install -m 755 "$TMP_DIR/caddy" /usr/bin/caddy
 run_command "为 Caddy 设置网络权限" sudo setcap cap_net_bind_service=+ep /usr/bin/caddy
+
+# 处理 AppArmor（Ubuntu 特有，Debian 默认不启用）
+# apt 安装的 caddy 会创建 AppArmor profile，替换为第三方二进制后需要设为 complain 模式
+if command -v apparmor_parser >/dev/null 2>&1 && systemctl is-active --quiet apparmor 2>/dev/null; then
+    log "CYAN" "检测到 AppArmor 正在运行，正在调整 Caddy 的 AppArmor 策略..."
+    if [[ -f /etc/apparmor.d/usr.bin.caddy ]]; then
+        run_command "将 Caddy AppArmor 策略设为 complain 模式" sudo aa-complain /usr/bin/caddy
+    fi
+fi
+
+run_command "重新加载 systemd 守护进程" sudo systemctl daemon-reload
 run_command "启动 Caddy 服务" sudo systemctl start caddy
 
 sleep 2
