@@ -413,8 +413,10 @@ list_certs() {
     local status_color status_text
 
     if [[ ! -d "$cert_dir" ]]; then
-        log "RED" "错误：未找到 Caddy 证书目录: ${cert_dir}"
-        return 1
+        log "YELLOW" "证书目录尚未创建，这是正常现象。"
+        log "YELLOW" "Caddy 会在服务启动后自动向 Let's Encrypt 申请 TLS 证书，请耐心等待约 5 分钟。"
+        log "CYAN"   "如需排查进度，可通过菜单 [11] 查看 Caddy 实时日志。"
+        return 0
     fi
 
     while IFS= read -r -d '' cert_path; do
@@ -465,8 +467,8 @@ clear_certs() {
     local cert_dir="/var/lib/caddy/.local/share/caddy/certificates"
 
     if [[ ! -d "$cert_dir" ]]; then
-        log "RED" "错误：未找到 Caddy 证书目录: ${cert_dir}"
-        return 1
+        log "YELLOW" "证书目录尚未创建，无证书可清理。"
+        return 0
     fi
 
     local files_count
