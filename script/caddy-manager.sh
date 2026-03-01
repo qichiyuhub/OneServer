@@ -390,9 +390,53 @@ check_status() {
 }
 
 view_logs() {
-    log "CYAN" "--- 查看 Caddy 日志 (进入后按 'F' 可实时跟踪) ---"
-    log "NC"   "     提示: 可以随时用上下箭头/PgUp/PgDn滚动查看历史"
-    journalctl -u "$CADDY_SERVICE" -n 200 --no-pager | less -R -P "--- 日志 (可滚动) | 按 F 实时跟踪 | 按 q 退出 ---"
+    local access_log="/var/log/caddy/access.log"
+
+    # 安全包装：运行实时跟踪命令，Ctrl+C 仅退出跟踪，不退出父脚本
+    _run_follow() {
+        local orig_trap
+        orig_trap=$(trap -p INT)
+        trap 'true' INT
+        "$@" || true
+        if [[ -n "$orig_trap" ]]; then
+            eval "$orig_trap" 2>/dev/null
+        else
+            trap - INT
+        fi
+        log "YELLOW" "已退出实时跟踪，正在返回日志菜单..."
+        sleep 1
+    }
+
+    while true; do
+        clear
+        log "CYAN" "--- 查看 Caddy 日志 ---"
+        echo -e "  ${YELLOW}[1]${NC} 系统日志 (journalctl)  — Caddy 启动/停止等 OS 级别事件"
+        echo -e "  ${YELLOW}[2]${NC} 综合日志 (tail -f)     — 全部 Caddy 日志: 配置文件配置全局日志"
+        echo -e "  ${YELLOW}[0]${NC} 返回上级菜单"
+        echo -e "  ${CYAN}提示: 实时跟踪中按 Ctrl+C 可退出并返回此菜单${NC}"
+        echo -e "${CYAN}------------------------------------------------------------${NC}"
+        read -rp "请输入选项 [0-2]: " log_choice
+
+        case "$log_choice" in
+            1)
+                log "CYAN" "--- Caddy 系统日志 (按 Ctrl+C 退出实时跟踪) ---"
+                _run_follow journalctl -f -u "$CADDY_SERVICE"
+                ;;
+            2)
+                if [[ ! -f "$access_log" ]]; then
+                    log "YELLOW" "日志文件尚未创建: ${access_log}"
+                    log "YELLOW" "Caddy 启动后会自动创建此文件，请稍后再试。"
+                    press_enter_to_continue
+                else
+                    log "CYAN" "--- Caddy 综合日志 — 实时跟踪 (按 Ctrl+C 退出) ---"
+                    _run_follow tail -f "$access_log"
+                fi
+                ;;
+            0) break ;;
+            *) log "RED" "无效输入！"; sleep 1 ;;
+        esac
+    done
+
     log "YELLOW" "\n--- 已退出日志查看，返回主菜单 ---"
 }
 
@@ -415,7 +459,7 @@ list_certs() {
     if [[ ! -d "$cert_dir" ]]; then
         log "YELLOW" "证书目录尚未创建，这是正常现象。"
         log "YELLOW" "Caddy 会在服务启动后自动向 Let's Encrypt 申请 TLS 证书，请耐心等待约 5 分钟。"
-        log "CYAN"   "如需排查进度，可通过菜单 [11] 查看 Caddy 实时日志。"
+        log "CYAN"   "如需排查进度，可通过菜单 [11] → [2] 查看 Caddy 综合日志（含 TLS 证书申请详情）。"
         return 0
     fi
 
