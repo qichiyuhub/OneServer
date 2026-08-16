@@ -1,0 +1,28 @@
+[Unit]
+Description=OneServer 面板实时档采集定时器
+Documentation=https://github.com/qichiyuhub/OneServer
+
+[Timer]
+# 同另外两档：OnUnitActiveSec 从上一轮**结束**算起，因此永远不会重叠，
+# 也不会像 OnCalendar 那样把一堆 unit 挤在同一秒唤醒。
+# OnActiveSec=1 让它在 timer 一被启用时就先采一轮，页面不用空等一个周期。
+#
+# **为什么是 10 秒而不是 3 秒**：每轮固定成本约 80 ms CPU（其中真正采集只有
+# 12 ms，其余是拉起 unit 与装配框架），3 秒一轮摊下来一天 38 分钟 CPU，是整个
+# 面板九成的开销。而你看面板是为了回答「这机器还好吗」——10 秒和 3 秒给的是
+# 同一个答案，差的只是数字跳动的手感。改成 10 秒省掉七成，且不需要任何新组件。
+#
+# 顺带解决了一个隐患：systemd 默认的启动频率限制是 10 秒 5 次，3 秒一轮只有
+# 1.5 倍余量，撞上就进 failed 且**从此不再运行**；10 秒一轮是 5 倍余量。
+# 真撞上了也不会没人知道——面板那条「数据已停止更新」告警正是为此存在的。
+OnActiveSec=1
+OnUnitActiveSec=10
+# 精度给到 1 秒。这一档的意义就是「看起来是实时的」，systemd 默认的
+# AccuracySec=1min 会把 3 秒的节拍整个抹掉
+AccuracySec=1s
+# **不要 Persistent**：错过的那一轮采的是「此刻」，补跑一个过去的「此刻」
+# 只会往快照里写过期数据
+Unit=oneserver-web-live.service
+
+[Install]
+WantedBy=timers.target

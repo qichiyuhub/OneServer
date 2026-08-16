@@ -1,0 +1,837 @@
+#!/bin/bash
+#
+# OneServer 交互式菜单 —— 注册表的第二个消费者
+#
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH
+umask 027
+
+# shellcheck disable=SC2034  # 理由：由 bootstrap.sh 读取，而那是运行期绝对路径，shellcheck 跟不进去
+OS_BOOT_MODE=frontend
+# 派发出去的命令据此知道自己由菜单启动。取本进程 PID 而不是 1：返回标记按它
+# 命名，两个会话各自一份（见 lib/paths.sh）。必须在装配之前置好 —— paths.sh
+# 是纯赋值层，路径在它被 source 的那一刻就定了。exec 自己不换 PID，标记不会漂。
+OS_FROM_MENU=$$
+export OS_FROM_MENU
+source /opt/oneserver/lib/bootstrap.sh
+source /opt/oneserver/lib/registry.sh
+
+# ------------------------------------------------------------------
+# 这个文件里没有任何具体脚本名，也没有命令 case 分支；菜单来自注册表。
+# 条目、分组、可见性全部来自注册表。
+#
+# 外观也一样：菜单长什么样只在渲染层定义一次，这里只调 `os::menu_render`
+# 与 `os::prompt`。菜单是全项目最容易长出排版代码的地方 ——
+# 一旦长出来，「改外观不改框架文件」当场失效（R13）。
+#
+# **编号按屏重排 1..N。** 从前编号直接用 `@order`，于是二级菜单上打的是
+# 51..55、虚拟分组「备份与恢复」的编号是 38 而它的两个成员是 33/34 ——
+# 同一次操作连按三层，看到的是 25 → 51 → 1。`@order` 现在只管排序，
+# 不再上屏，每一屏都从 1 数起。
+#
+# **导航是一个路径栈。** 回车在任何一层都是「返回上一层」，栈空才退出。
+# 从前三级菜单的回车直接 exec 回主菜单，把中间那层整个跳过。栈要穿过
+# 命令执行后的那次 `exec`（不变量 9），所以它落在环境变量 OS_MENU_PATH 上。
+#
+# **状态面板全部经 probe::\***。旧 menu.sh 是一整块
+# 就地探测 + `set +e` 屏蔽错误：podman 无响应时工具直接开不了机（K14）。
+
+# **Ctrl+C 的语义是「取消当前这件事」**，按此刻是谁在等输入分两层：
+#
+#   * 命令正在跑 —— 取消那条命令。菜单与它派发的命令在同一个进程组里，终端把
+#     SIGINT 发给整组：命令自己按规范以 131 收场并打出变更清单（§10），菜单
+#     只需要活下来，随后照既有那条路打「上一条命令以退出码 131 结束」并等回车。
+#     **中断后的变更清单必须让人读到**，所以不在 trap 里直接跳回列表。
+#   * 菜单自己在等输入 —— 没有「当前这件事」可取消，那就是要离开工具，直接退出。
+#
+# 于是连按两次正好是「先回菜单、再退出」。**判据是「此刻谁在等输入」，不是
+# 「两次按键相隔多久」**：后者在 ssh 有延迟时会把一次连按判成两次独立按键，
+# 同样的操作时灵时不灵。
+#
+# 只覆盖菜单进程。派发出去的命令是独立进程，trap 不会被继承成处理器，
+# 它们各自装各自的（这也是不能用 `trap '' INT` 的原因：那是 SIG_IGN，
+# **会**被子进程继承，而被忽略的信号在子 shell 里 trap 不回来）。
+OS_MENU_WAITING=0
+menu_on_int() {
+    ((OS_MENU_WAITING == 1)) || return 0
+    printf '\n'
+    os::info '已退出'
+    exit 130
+}
+trap menu_on_int INT
+
+OS_MENU_PAIRS=()
+OS_MENU_VERSION=''
+
+# 规范要求消费者逐项标注数据来源。措辞收在 probe::describe 里，这里只负责
+# 贴上去 —— doctor、面板、菜单不会各写各的。
+#
+# **只标注不是实时的那些。** 六行状态每行都缀一个「（实时）」是六份同样的
+# 噪音，而这条规则真正要防的是「把缓存当成实时读」。非实时的标注自己就说清了
+# 是什么（「缓存 · 3分钟前」），不必再在别处给一句汇总。
+menu_row() {
+    local note
+    note=$(probe::describe)
+    if [[ ${note} == 实时 ]]; then
+        OS_MENU_PAIRS+=("${1}" "${2}")
+    else
+        OS_MENU_PAIRS+=("${1}" "${2}（${note}）")
+    fi
+    return 0
+}
+
+human_duration() {
+    local -i s=${1:-0}
+    if ((s < 3600)); then
+        printf '%d 分钟\n' $((s / 60))
+    elif ((s < 86400)); then
+        printf '%d 小时\n' $((s / 3600))
+    else
+        printf '%d 天 %d 小时\n' $((s / 86400)) $(((s % 86400) / 3600))
+    fi
+    return 0
+}
+
+# 状态面板 —— **只放不起进程就能答出来的行**：发行版与内核、CPU 型号、已运行多久。
+#
+# 判据是成本，不是重要性。主屏是每次进菜单、每跑完一条命令回来都要重画的一屏，
+# 它上面每一行的代价都要乘以一天进多少次菜单。/proc 是纯读，整屏合起来是毫秒
+# 量级；而 `ufw status` 要起一个 python 解释器，`podman ps` / `docker ps` 各要起
+# 一次 Go 二进制再连一次守护进程 —— 高出两三个数量级，在 1 核小机器上就是每次
+# 进菜单干等大半秒。
+#
+# 挪走的那几项各有自己的入口，都在菜单里点得到：防火墙看 `firewall`，Web 面板的
+# 端口与访问策略看 `web`，两个引擎的容器数分别看 `docker` 与 `podman`；`doctor`
+# 另给一份系统概览（含防火墙与 Podman 容器数）。主屏答「这台机器是什么」，
+# 「现在跑得怎么样」是要看的时候才看，不是每屏都付一次钱。
+#
+# 于是主屏也不再依赖容器引擎：podman 或 docker 挂住时，从前全靠 probe 的超时
+# 兜着才开得了机（K14），现在这一屏压根不问它们。
+show_panel() {
+    OS_MENU_VERSION='未知'
+    if [[ -r ${OS_VERSION_FILE} ]]; then
+        IFS= read -r OS_MENU_VERSION <"${OS_VERSION_FILE}" || true
+    fi
+
+    OS_MENU_PAIRS=()
+
+    probe::os_pretty
+    local pretty=${OS_PROBE_VALUE:-未知}
+    local data_source=${OS_PROBE_SOURCE}
+    probe::kernel
+    menu_row '系统' "${pretty} · 内核 ${OS_PROBE_VALUE:-未知}"
+
+    probe::cpu_model
+    menu_row 'CPU' "${OS_PROBE_VALUE:-未知}"
+
+    probe::uptime_seconds
+    if [[ ${OS_PROBE_STATUS} == ok ]]; then
+        menu_row '已运行' "$(human_duration "${OS_PROBE_VALUE:-0}")"
+    fi
+
+    # 非 root 时数据来自快照。用 probe 自己给出的来源判断，不去看 EUID ——
+    # 规范禁止脚本自行做权限判断，而这里要说的本来也是「数据是哪来的」
+    if [[ ${data_source} != live ]]; then
+        menu_row '提示' '当前非 root：状态取自快照，需要 root 的命令会以退出码 4 拒绝'
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 注册表查询
+# ------------------------------------------------------------------
+
+# menu_index_tree   扫描后**算一次**：可见性、父条目、下级数
+#
+# --- 折叠规则 ---
+#
+# 命令若其父命令也在注册表里，就归到父条目名下 —— `podman image` 归 `podman`。
+# 父命令**不在**注册表里的（`install php` 的 `install`、`php config` 的 `php`）
+# 留在顶层：那时没有可供选中的父条目，折叠它等于把它藏起来。
+#
+# **层级取自 `@command` 本身，不加元数据字段** —— 命令路径里已经写明谁是谁的下级，
+# 再来一个 `@parent` 就是同一件事的第二份声明，两份迟早对不上。
+#
+# **父条目自己不可见时不折叠**：`@requires` 把父条目隐藏了还照折不误的话，
+# 子条目就藏在了一个选不中的东西下面 —— 那不是折叠，是让命令从菜单上消失。
+#
+# --- 为什么先算一遍 ---
+#
+# 这三样每一屏都要问很多遍，而它们在一次 registry::scan 之内不会变。
+# 从前是现问现算，且「某条命令的父条目是谁」是靠 `$( )` 取回来的，每问一次
+# fork 一个子 shell —— 一屏 n 个条目、每个又要知道自己有没有下级（那又是一轮
+# n 次），于是重画一次菜单就是 O(n²) 个进程。脚本越加越多菜单越开越慢，
+# 而这正是「以后随便加脚本」最不该付的代价。
+OS_MENU_VISIBLE=()
+OS_MENU_PARENT=()
+OS_MENU_KIDS=()
+menu_index_tree() {
+    OS_MENU_VISIBLE=()
+    OS_MENU_PARENT=()
+    OS_MENU_KIDS=()
+    local cmd
+    local -i i j
+    for ((i = 0; i < OS_REG_COUNT; i++)); do
+        if registry::requires_met "${i}"; then
+            OS_MENU_VISIBLE[i]=1
+        else
+            OS_MENU_VISIBLE[i]=0
+        fi
+        OS_MENU_PARENT[i]=-1
+        OS_MENU_KIDS[i]=0
+    done
+    # 父条目 = 最长的、已注册且**可见**的前缀命令。父条目被 @requires 藏起来时
+    # 不折叠，否则子条目就挂在一个选不中的东西下面 —— 那不是折叠，是消失
+    for ((i = 0; i < OS_REG_COUNT; i++)); do
+        cmd=${OS_REG_COMMAND[i]}
+        while [[ ${cmd} == *' '* ]]; do
+            cmd=${cmd% *}
+            for ((j = 0; j < OS_REG_COUNT; j++)); do
+                if [[ ${OS_REG_COMMAND[j]} == "${cmd}" ]] && ((OS_MENU_VISIBLE[j] == 1)); then
+                    OS_MENU_PARENT[i]=${j}
+                    break
+                fi
+            done
+            if ((OS_MENU_PARENT[i] >= 0)); then
+                break
+            fi
+        done
+    done
+    for ((i = 0; i < OS_REG_COUNT; i++)); do
+        if ((OS_MENU_VISIBLE[i] == 1)); then
+            j=${OS_MENU_PARENT[i]}
+            if ((j >= 0)); then
+                OS_MENU_KIDS[j]=$((OS_MENU_KIDS[j] + 1))
+            fi
+        fi
+    done
+    return 0
+}
+
+# menu_index_of <命令>   下标写进 OS_MENU_IDX，没有则 -1
+#
+# 写变量不打印，同 menu_target_of：调用点在导航与渲染的热路径上，`$( )` 每次都 fork。
+OS_MENU_IDX=-1
+menu_index_of() {
+    local cmd=${1-}
+    local -i i
+    OS_MENU_IDX=-1
+    for ((i = 0; i < OS_REG_COUNT; i++)); do
+        if [[ ${OS_REG_COMMAND[i]} == "${cmd}" ]]; then
+            OS_MENU_IDX=${i}
+            return 0
+        fi
+    done
+    return 0
+}
+
+# menu_group_of <分组>   显示名 / 父分组 / 说明一次查齐，结果写三个变量
+#
+# 语义与 registry::group_name / group_parent / group_desc 逐字一致，包括未声明
+# 分组的回落（名字回落成 id 本身，父与说明为空）—— 那三个是打印函数，而这里
+# 一屏要问几十遍，`$( )` 每次都 fork。**不动那三个函数本身**：它们的打印契约
+# 有测试在断言，而菜单本来就直接读 OS_REG_* 数组（同 menu_index_tree）。
+#
+# 三个值一次查齐而不是三个函数：调用点问的往往不止一样，分开查就要把同一张
+# 表扫三遍。
+OS_MENU_GNAME=''
+OS_MENU_GPARENT=''
+OS_MENU_GDESC=''
+menu_group_of() {
+    local id=${1-}
+    local -i i
+    OS_MENU_GNAME=${id}
+    OS_MENU_GPARENT=''
+    OS_MENU_GDESC=''
+    for ((i = 0; i < OS_REG_GROUP_COUNT; i++)); do
+        [[ ${OS_REG_GROUP_ID[i]} == "${id}" ]] || continue
+        OS_MENU_GNAME=${OS_REG_GROUP_NAME[i]}
+        OS_MENU_GPARENT=${OS_REG_GROUP_PARENT[i]}
+        OS_MENU_GDESC=${OS_REG_GROUP_DESC[i]}
+        return 0
+    done
+    return 0
+}
+
+# menu_toplevel <下标>   这条命令是不是所在层的顶层（没被父命令折叠走）
+menu_toplevel() {
+    ((OS_MENU_PARENT[${1}] < 0))
+}
+
+# 某个条目的直接下级，按排序好的顺序，@requires 不满足的已剔除
+OS_MENU_CHILDREN=()
+menu_children_of() {
+    local -i want=${1} i idx
+    OS_MENU_CHILDREN=()
+    for ((i = 0; i < ${#OS_REG_SORTED[@]}; i++)); do
+        idx=${OS_REG_SORTED[i]}
+        if ((OS_MENU_VISIBLE[idx] == 1 && OS_MENU_PARENT[idx] == want)); then
+            OS_MENU_CHILDREN+=("${idx}")
+        fi
+    done
+    return 0
+}
+
+# menu_group_has <分组> [深度]   这个分组下有没有可见内容（含子分组，递归）
+#
+# **深度上限。** 成环由 `registry::groups_load` 在加载时断掉并告警，这里挡的是另一半：
+# 不成环但嵌套过深的手写配置 —— 分组套到第五层，菜单已经不是导航而是迷宫。
+# 截断比递归更安全：配错的分组顶多不显示，工具还开得起来。
+OS_MENU_DEPTH_MAX=4
+menu_group_has() {
+    local want=${1}
+    local -i depth=${2:-0} i idx
+    ((depth < OS_MENU_DEPTH_MAX)) || return 1
+    for ((i = 0; i < ${#OS_REG_SORTED[@]}; i++)); do
+        idx=${OS_REG_SORTED[i]}
+        [[ ${OS_REG_GROUP[idx]} == "${want}" ]] || continue
+        ((OS_MENU_VISIBLE[idx] == 1)) || continue
+        if menu_toplevel "${idx}"; then
+            return 0
+        fi
+    done
+    for ((i = 0; i < OS_REG_GROUP_COUNT; i++)); do
+        [[ ${OS_REG_GROUP_PARENT[i]} == "${want}" ]] || continue
+        if menu_group_has "${OS_REG_GROUP_ID[i]}" $((depth + 1)); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# menu_subgroups <分组>   有内容的子分组，按分组 order 排好，结果写 OS_MENU_SUBGROUPS
+OS_MENU_SUBGROUPS=()
+menu_subgroups() {
+    local want=${1}
+    OS_MENU_SUBGROUPS=()
+    local -a ord=()
+    local -i i j n
+    for ((i = 0; i < OS_REG_GROUP_COUNT; i++)); do
+        [[ ${OS_REG_GROUP_PARENT[i]} == "${want}" ]] || continue
+        if menu_group_has "${OS_REG_GROUP_ID[i]}"; then
+            OS_MENU_SUBGROUPS+=("${OS_REG_GROUP_ID[i]}")
+            ord+=("${OS_REG_GROUP_ORDER[i]}")
+        fi
+    done
+    # 插入排序，同 registry::sort：几个元素不值得 fork 一个 sort
+    local tmp
+    local -i key
+    n=${#OS_MENU_SUBGROUPS[@]}
+    for ((i = 1; i < n; i++)); do
+        tmp=${OS_MENU_SUBGROUPS[i]}
+        key=${ord[i]}
+        for ((j = i - 1; j >= 0; j--)); do
+            ((ord[j] > key)) || break
+            OS_MENU_SUBGROUPS[j + 1]=${OS_MENU_SUBGROUPS[j]}
+            ord[j + 1]=${ord[j]}
+        done
+        OS_MENU_SUBGROUPS[j + 1]=${tmp}
+        ord[j + 1]=${key}
+    done
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 一屏的内容
+#
+# 目标（target）三种前缀，导航只认这三种：
+#   g:<分组>   下潜到分组
+#   c:<命令>   下潜到命令（它还有下级）
+#   r:<命令>   执行这条命令
+# ------------------------------------------------------------------
+
+OS_SCR_TITLE=''
+# 标题后那格只说一件事：**这一屏对应的命令行写法**。分组不是命令、主屏是工具
+# 自己，两者都留空。从前它在主屏装数据新鲜度、在命令屏装命令名 —— 同一个位置
+# 两种含义，用户就没法从位置本身读出信息
+OS_SCR_META=''
+OS_SCR_LABEL=()
+OS_SCR_DESC=()
+OS_SCR_TARGET=()
+OS_SCR_HEAD=()
+OS_SCR__LASTHEAD=''
+
+menu_emit() {
+    local head=${4-}
+    if [[ ${head} != "${OS_SCR__LASTHEAD}" ]]; then
+        OS_SCR_HEAD+=("${head}")
+        OS_SCR__LASTHEAD=${head}
+    else
+        OS_SCR_HEAD+=('')
+    fi
+    OS_SCR_LABEL+=("${1}")
+    OS_SCR_DESC+=("${2}")
+    OS_SCR_TARGET+=("${3}")
+    return 0
+}
+
+# menu_target_of <下标>   有下级就下潜，没有就执行；结果写 OS_MENU_TGT
+#
+# 写变量不打印：调用点在循环里，`$( )` 每次都 fork，而这里只是查一张已经算好的表。
+OS_MENU_TGT=''
+menu_target_of() {
+    local -i idx=${1}
+    if ((OS_MENU_KIDS[idx] > 0)); then
+        OS_MENU_TGT="c:${OS_REG_COMMAND[idx]}"
+    else
+        OS_MENU_TGT="r:${OS_REG_COMMAND[idx]}"
+    fi
+    return 0
+}
+
+# menu_group_summary <分组>   分组虚拟项的说明列：里面装着什么，结果写 OS_MENU_SUMMARY。
+#
+# **列全部成员，本函数不自己截断。** 从前只列前两个再补一个「等」，于是
+# 「系统与维护」永远显示成「服务器安全设置 · 脚本更新 等」—— 而那一组四条
+# 全是出事时要立刻找到的东西，有两条被一个「等」字盖住了。
+#
+# 放不下的由渲染层按说明列宽截成 `…`，与整屏其余说明列是同一套截断记号；
+# 自己按条数砍就是在 bin/ 里做宽度排版的近似（规范 §9 不许），而且近似得不准：
+# 两条短名字明明放得下第三条，九条长名字砍到两条仍然要被 `…` 再砍一次。
+OS_MENU_SUMMARY=''
+menu_group_summary() {
+    local g=${1} out='' sep='' one
+    local -a names=()
+    local -i i idx cmds=0 only=-1
+    OS_MENU_SUMMARY=''
+    for ((i = 0; i < ${#OS_REG_SORTED[@]}; i++)); do
+        idx=${OS_REG_SORTED[i]}
+        [[ ${OS_REG_GROUP[idx]} == "${g}" ]] || continue
+        ((OS_MENU_VISIBLE[idx] == 1)) || continue
+        if menu_toplevel "${idx}"; then
+            names+=("${OS_REG_NAME[idx]}")
+            only=${idx}
+            cmds+=1
+        fi
+    done
+    # 先把子分组列表复制走再遍历：本函数从前跑在 `$( )` 里，对 OS_MENU_SUBGROUPS
+    # 的改写出不了子 shell；现在它就地执行，而调用方（menu_screen_group）可能
+    # 正在遍历同一个数组。同 menu_screen_cmd 对 OS_MENU_CHILDREN 的做法。
+    menu_subgroups "${g}"
+    local -a subs=(${OS_MENU_SUBGROUPS[@]+"${OS_MENU_SUBGROUPS[@]}"})
+    for one in ${subs[@]+"${subs[@]}"}; do
+        menu_group_of "${one}"
+        names+=("${OS_MENU_GNAME}")
+    done
+
+    local -i total=${#names[@]}
+    # 只有一个成员时列它的名字，等于把分组名重说一遍（「Podman 容器 › 容器管理」）。
+    # 而这种分组一进去就被自动跳过，被重说的那一层用户根本看不到 —— 改说这一栏
+    # 覆盖什么，这一行才真的在回答「里面装着什么」。
+    #
+    # **优先用分组自己的说明**（groups.conf 第五列）。回落到成员脚本的
+    # `@description` 是不得已：那句写的是那一条命令干什么，而成员只剩一条往往
+    # 是别的成员被 `@requires` 隐掉了 —— 于是「数据库 › 查看 Valkey 状态」看着
+    # 像这一栏只有 Valkey，其实是 MariaDB 没装。分组没写说明时仍然回落，
+    # 让 groups.conf 的第五列保持可选。
+    if ((total == 1 && cmds == 1)); then
+        menu_group_of "${g}"
+        OS_MENU_SUMMARY=${OS_MENU_GDESC:-${OS_REG_DESC[only]}}
+        return 0
+    fi
+    for ((i = 0; i < total; i++)); do
+        out+="${sep}${names[i]}"
+        sep=' · '
+    done
+    OS_MENU_SUMMARY=${out}
+    return 0
+}
+
+menu_screen_root() {
+    OS_SCR_TITLE="OneServer ${OS_MENU_VERSION}"
+    local g gp gname head
+    local -a seen=()
+    local -i i j idx dup
+    for ((i = 0; i < ${#OS_REG_SORTED[@]}; i++)); do
+        idx=${OS_REG_SORTED[i]}
+        ((OS_MENU_VISIBLE[idx] == 1)) || continue
+        menu_toplevel "${idx}" || continue
+        g=${OS_REG_GROUP[idx]}
+        # 名字先取走：下面几次 menu_group_of 会覆盖那三个变量
+        menu_group_of "${g}"
+        gp=${OS_MENU_GPARENT}
+        gname=${OS_MENU_GNAME}
+        if [[ -z ${gp} ]]; then
+            # **主屏上真命令不带说明列。** `@description` 是写给 `--help` 的整句，
+            # 摆进主菜单只会被截成一行省略号，九条挨在一起就是九个 `…`。
+            # 说明列在这一屏留给虚拟项 —— 它要回答的是「里面装着什么」，
+            # 那件事从名字上看不出来。进到下一层，整句说明就都在了。
+            menu_target_of "${idx}"
+            menu_emit "${OS_REG_NAME[idx]}" '' "${OS_MENU_TGT}" "${gname}"
+            continue
+        fi
+        # 收纳分组：整组折成一个虚拟项，同组的后续脚本不再各出一条
+        dup=0
+        for ((j = 0; j < ${#seen[@]}; j++)); do
+            if [[ ${seen[j]} == "${g}" ]]; then
+                dup=1
+                break
+            fi
+        done
+        if ((dup == 1)); then
+            continue
+        fi
+        seen+=("${g}")
+        menu_group_of "${gp}"
+        head=${OS_MENU_GNAME}
+        menu_group_summary "${g}"
+        menu_emit "${gname}" "${OS_MENU_SUMMARY}" "g:${g}" "${head}"
+    done
+    return 0
+}
+
+menu_screen_group() {
+    local g=${1} one
+    local -i i idx
+    for ((i = 0; i < ${#OS_REG_SORTED[@]}; i++)); do
+        idx=${OS_REG_SORTED[i]}
+        [[ ${OS_REG_GROUP[idx]} == "${g}" ]] || continue
+        ((OS_MENU_VISIBLE[idx] == 1)) || continue
+        if menu_toplevel "${idx}"; then
+            menu_target_of "${idx}"
+            menu_emit "${OS_REG_NAME[idx]}" "${OS_REG_DESC[idx]}" "${OS_MENU_TGT}"
+        fi
+    done
+    # 复制走再遍历，理由同 menu_group_summary：下面的 menu_group_summary 会
+    # 就地重算 OS_MENU_SUBGROUPS
+    menu_subgroups "${g}"
+    local -a subs=(${OS_MENU_SUBGROUPS[@]+"${OS_MENU_SUBGROUPS[@]}"})
+    local gname
+    for one in ${subs[@]+"${subs[@]}"}; do
+        menu_group_of "${one}"
+        gname=${OS_MENU_GNAME}
+        menu_group_summary "${one}"
+        menu_emit "${gname}" "${OS_MENU_SUMMARY}" "g:${one}"
+    done
+    return 0
+}
+
+# 父条目自己也列在里面 —— 它是一条真命令（`podman` 就是容器管理本身），
+# 不列的话就没法选到它，而且它排第一：进来最可能要的就是它。
+#
+# 标签取 `@self_name`，没填才回落 `@name`。标题栏这时已经写着
+# `应用 › 安装应用`，第一项再叫一次「安装应用」就是把同一个词说了两遍 ——
+# 而这一项真正要回答的是「选中它会执行什么」，与它在上一层的名字不是一件事。
+menu_screen_cmd() {
+    local cmd=${1}
+    local -i idx c ci
+    menu_index_of "${cmd}"
+    idx=${OS_MENU_IDX}
+    ((idx >= 0)) || return 1
+    OS_SCR_META="oneserver ${cmd}"
+    menu_emit "${OS_REG_SELF_NAME[idx]:-${OS_REG_NAME[idx]}}" \
+        "${OS_REG_DESC[idx]}" "r:${cmd}"
+    menu_children_of "${idx}"
+    local -a kids=(${OS_MENU_CHILDREN[@]+"${OS_MENU_CHILDREN[@]}"})
+    for ((c = 0; c < ${#kids[@]}; c++)); do
+        ci=${kids[c]}
+        menu_target_of "${ci}"
+        menu_emit "${OS_REG_NAME[ci]}" "${OS_REG_DESC[ci]}" "${OS_MENU_TGT}"
+    done
+    return 0
+}
+
+menu_screen() {
+    local node=${1-}
+    OS_SCR_TITLE=''
+    OS_SCR_META=''
+    OS_SCR_LABEL=()
+    OS_SCR_DESC=()
+    OS_SCR_TARGET=()
+    OS_SCR_HEAD=()
+    OS_SCR__LASTHEAD=''
+    case ${node} in
+        '') menu_screen_root ;;
+        g:*) menu_screen_group "${node#g:}" ;;
+        c:*) menu_screen_cmd "${node#c:}" ;;
+    esac
+    [[ -n ${OS_SCR_TITLE} ]] || OS_SCR_TITLE=$(menu_path_title)
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 导航
+# ------------------------------------------------------------------
+
+OS_MENU_STACK=()
+
+# 结果写 OS_MENU_LABEL：调用点在面包屑的循环里，栈每深一层就多一次 `$( )`
+OS_MENU_LABEL=''
+menu_node_label() {
+    local node=${1}
+    OS_MENU_LABEL=''
+    case ${node} in
+        g:*)
+            menu_group_of "${node#g:}"
+            OS_MENU_LABEL=${OS_MENU_GNAME}
+            ;;
+        c:*)
+            menu_index_of "${node#c:}"
+            if ((OS_MENU_IDX >= 0)); then
+                OS_MENU_LABEL=${OS_REG_NAME[OS_MENU_IDX]}
+            else
+                OS_MENU_LABEL=${node#c:}
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 面包屑：栈里每一层的名字。用户看得到自己在哪、从哪来
+menu_path_title() {
+    local out='' sep='' one
+    for one in ${OS_MENU_STACK[@]+"${OS_MENU_STACK[@]}"}; do
+        menu_node_label "${one}"
+        out+="${sep}${OS_MENU_LABEL}"
+        sep=' › '
+    done
+    printf '%s\n' "${out}"
+    return 0
+}
+
+# 栈要穿过命令执行后的那次 exec（不变量 9：菜单每转一圈都重新装配 lib 与
+# 注册表）。内存里的东西活不过 exec，所以它走环境变量，节点之间用制表符分隔
+# —— 节点里出现的是分组 id 与命令名，两者都不含制表符。
+menu_stack_save() {
+    local out='' sep='' one
+    for one in ${OS_MENU_STACK[@]+"${OS_MENU_STACK[@]}"}; do
+        out+="${sep}${one}"
+        sep=$'\t'
+    done
+    OS_MENU_PATH=${out}
+    export OS_MENU_PATH
+    return 0
+}
+
+# 恢复时**逐层验证**：注册表可能因为刚跑完 install / uninstall 而变了样，
+# 照着一条失效的路径画下去，用户会停在一屏空菜单上却不知道为什么。
+#
+# 命令层查的是「在注册表里**且可见**」，两个缺一不可：`@requires` 是随 state 变的，
+# 而卸载正是让它从满足变不满足的那件事。只查前者的话，刚卸完组件 exec 回来，
+# 菜单会停在一屏本该被隐藏的命令上（规范 §6：不满足时菜单隐藏该条目）。
+menu_stack_restore() {
+    OS_MENU_STACK=()
+    local raw=${OS_MENU_PATH:-} one
+    # 取完就从环境里摘掉：它是菜单自己的东西，没有理由跟着派发出去的命令
+    # 一路传进它的子进程
+    unset OS_MENU_PATH
+    [[ -n ${raw} ]] || return 0
+    local -a want=()
+    IFS=$'\t' read -r -a want <<<"${raw}"
+    for one in ${want[@]+"${want[@]}"}; do
+        [[ -n ${one} ]] || continue
+        case ${one} in
+            g:*) menu_group_has "${one#g:}" || break ;;
+            c:*)
+                menu_index_of "${one#c:}"
+                ((OS_MENU_IDX >= 0 && OS_MENU_VISIBLE[OS_MENU_IDX] == 1)) || break
+                ;;
+            *) break ;;
+        esac
+        OS_MENU_STACK+=("${one}")
+    done
+    return 0
+}
+
+# 派发：命令跑在自己的进程里（fork + wait，不是 exec）—— 锁、回滚栈、变更清单、
+# probe 缓存全部随子进程一起结束，不会跨命令累积。菜单在这期间只是等待。
+menu_run() {
+    local cmd=${1}
+    local -i idx rc=0
+    menu_index_of "${cmd}"
+    idx=${OS_MENU_IDX}
+    ((idx >= 0)) || return 0
+    local file=${OS_REG_FILE[idx]}
+    if [[ ! -x ${file} ]]; then
+        os::die 4 "命令脚本没有执行位：${file}"
+    fi
+    log::write info "菜单派发：${cmd} → ${file}" framework
+
+    rm -f -- "${OS_MENU_BACK_FLAG}" 2>/dev/null || true
+    "${file}" || rc=$?
+
+    # 用户在二级菜单里选了「返回上一层」——屏幕上没有新东西要读，
+    # 再问一次「按回车」纯属多按一下。记号由 os::action_menu 留下
+    if [[ -e ${OS_MENU_BACK_FLAG} ]]; then
+        rm -f -- "${OS_MENU_BACK_FLAG}" 2>/dev/null || true
+    else
+        # 130（用户取消）与 131（被信号打断）不再复述：那是用户自己刚做的动作，
+        # 而且被打断时 errors.sh 已经在屏幕上打过「被 X 打断，已停止执行」。
+        # 用 os::warn 说第三遍，等于把一次正常操作记成异常送进面板
+        if ((rc != 0 && rc != 130 && rc != 131)); then
+            os::warn "上一条命令以退出码 ${rc} 结束"
+        fi
+        os::prompt "${OS_UI_SYM_ENTER} 返回菜单 · q 退出" 0
+        local back=''
+        # 读不到（stdin 不是终端、或者被上一条命令读空了）就退出，不然会空转。
+        # Ctrl+C 走不到这里：菜单在等输入，trap 直接退出工具
+        OS_MENU_WAITING=1
+        IFS= read -r back || back='q'
+        OS_MENU_WAITING=0
+        case ${back} in
+            q | Q) exit "${rc}" ;;
+        esac
+    fi
+
+    # 回菜单前 `exec` 自己：重新装配 lib、重新扫注册表。
+    # **这是菜单敢常驻的全部依据** —— 刚跑完 `oneserver update` 之后，
+    # 内存里那份 lib 与注册表已经是上一个版本的了，带着它们继续服务，
+    # 表现就是「更新完了菜单还是旧的」，而且没有任何提示。
+    menu_stack_save
+    exec "${OS_BIN_DIR}/oneserver-menu"
+}
+
+# menu_pop   返回上一层；连着弹掉那些一进去就会被自动跳过的分组层
+#
+# 自动下潜与返回本来会打架：单成员分组一进就被跳过（下面那段），而回退到它
+# 时又会被同一段跳进去 —— 回车在那一层永远出不来，`Podman 容器` /
+# `Docker 容器` 就是这个形状（分组下唯一的成员正是折叠了其余命令的父命令）。
+#
+# 判据不额外记状态：「这一层只有一个成员」本身就是当初自动下潜的原因，
+# 注册表没变结论就不会变，穿过 exec 重算一次照样成立。
+menu_pop() {
+    local node
+    ((${#OS_MENU_STACK[@]} > 0)) || return 0
+    unset 'OS_MENU_STACK[${#OS_MENU_STACK[@]}-1]'
+    while ((${#OS_MENU_STACK[@]} > 0)); do
+        node=${OS_MENU_STACK[${#OS_MENU_STACK[@]} - 1]}
+        [[ ${node} == g:* ]] || break
+        menu_screen "${node}"
+        ((${#OS_SCR_LABEL[@]} == 1)) || break
+        unset 'OS_MENU_STACK[${#OS_MENU_STACK[@]}-1]'
+    done
+    return 0
+}
+
+menu_loop() {
+    local reply='' notice='' node='' target=''
+    # bad 只数**连续**的错输入，选对一次就清零
+    local -i i n choice bad=0
+    while :; do
+        node=''
+        if ((${#OS_MENU_STACK[@]} > 0)); then
+            node=${OS_MENU_STACK[${#OS_MENU_STACK[@]} - 1]}
+        fi
+        # 状态面板只在主屏上屏。它现在只读 /proc（见 show_panel），代价已经很小，
+        # 但仍然按需探：进来时在哪一层就先不探，回到主屏那一刻才探 —— 面板不上屏
+        # 的那几层，探了也没人看得到。
+        # 面板至少含「系统」一行，非空即已探过，不必另立标志
+        if ((${#OS_MENU_STACK[@]} == 0 && ${#OS_MENU_PAIRS[@]} == 0)); then
+            show_panel
+        fi
+        menu_screen "${node}"
+        n=${#OS_SCR_LABEL[@]}
+        if ((n == 0)); then
+            if ((${#OS_MENU_STACK[@]} == 0)); then
+                os::warn '注册表里没有可用条目'
+                return 1
+            fi
+            menu_pop
+            continue
+        fi
+        # 只有一个成员的分组不值得让人确认一次 —— 能选的东西只有那一个，直接进去。
+        #
+        # **成员是叶子命令时，得先把分组弹出栈再派发。** 直接把 `r:...` 压进栈的
+        # 后果是下一圈 menu_screen 认不出它（只有 g:/c: 两个分支），画出一屏空菜单，
+        # 于是 menu_pop 连分组一起弹掉 —— 表现是点进去瞬间弹回主屏，那一条命令
+        # 从此选不中。而弹栈也不能省：menu_run 结尾要 exec 自己，回来时恢复出的
+        # 栈顶若还是这个分组，又会被这段自动跳进去，用户再也回不到上一层。
+        if ((n == 1)) && [[ ${node} == g:* ]]; then
+            target=${OS_SCR_TARGET[0]}
+            if [[ ${target} == r:* ]]; then
+                menu_pop
+                menu_run "${target#r:}"
+                return 0
+            fi
+            OS_MENU_STACK+=("${target}")
+            continue
+        fi
+
+        local -a args=(--title "${OS_SCR_TITLE}")
+        [[ -n ${OS_SCR_META} ]] && args+=(--meta "${OS_SCR_META}")
+        [[ -n ${notice} ]] && args+=(--notice "${notice}")
+        if ((${#OS_MENU_STACK[@]} == 0)); then
+            for ((i = 0; i < ${#OS_MENU_PAIRS[@]}; i += 2)); do
+                args+=(--status "${OS_MENU_PAIRS[i]}" "${OS_MENU_PAIRS[i + 1]}")
+            done
+        fi
+        for ((i = 0; i < n; i++)); do
+            [[ -n ${OS_SCR_HEAD[i]} ]] && args+=(--group "${OS_SCR_HEAD[i]}")
+            if [[ ${OS_SCR_TARGET[i]} == r:* ]]; then
+                args+=(--item "$((i + 1))" "${OS_SCR_LABEL[i]}" "${OS_SCR_DESC[i]}")
+            else
+                args+=(--subitem "$((i + 1))" "${OS_SCR_LABEL[i]}" "${OS_SCR_DESC[i]}")
+            fi
+        done
+        if ((${#OS_MENU_STACK[@]} == 0)); then
+            args+=(--nav root)
+        else
+            args+=(--nav submenu)
+        fi
+        os::menu_render "${args[@]}"
+        notice=''
+
+        os::prompt '' 0
+        # 读不到就退出（stdin 不是终端），不然会空转。
+        # Ctrl+C 走不到这里：菜单在等输入，trap 直接退出工具
+        OS_MENU_WAITING=1
+        IFS= read -r reply || return 0
+        OS_MENU_WAITING=0
+        # 回车 = 返回上一层，任何一层都一样；栈空时那一层就是「离开菜单」
+        if [[ -z ${reply} ]]; then
+            if ((${#OS_MENU_STACK[@]} == 0)); then
+                os::info '已退出'
+                return 0
+            fi
+            bad=0
+            menu_pop
+            continue
+        fi
+        if [[ ${reply} =~ ^[0-9]+$ ]]; then
+            choice=$((10#${reply}))
+            if ((choice >= 1 && choice <= n)); then
+                target=${OS_SCR_TARGET[choice - 1]}
+                if [[ ${target} == r:* ]]; then
+                    menu_run "${target#r:}"
+                    return 0
+                fi
+                bad=0
+                OS_MENU_STACK+=("${target}")
+                continue
+            fi
+            notice="这一屏没有编号 ${reply}"
+            bad+=1
+            ((bad < 3)) || os::die 2 "连续三次没有给出这一屏存在的编号"
+            continue
+        fi
+        # 命令名直达。注册表本来就按最长前缀路由，敲 `db`、`podman image`
+        # 就跳过去 —— 收纳分组让层级深了一点，熟手不必跟着一层层点
+        local -a words=()
+        IFS=$' \t' read -r -a words <<<"${reply}"
+        if registry::resolve ${words[@]+"${words[@]}"} && ((OS_MENU_VISIBLE[OS_REG_MATCH] == 1)); then
+            menu_run "${OS_REG_COMMAND[OS_REG_MATCH]}"
+            return 0
+        fi
+        notice="没有编号或命令名为「${reply}」的条目"
+        bad+=1
+        ((bad < 3)) || os::die 2 "连续三次没有给出可用的编号或命令名"
+    done
+}
+
+main() {
+    registry::groups_load
+    registry::scan
+    # **必须排在 menu_stack_restore 之前。** 逐层验证里的 menu_group_has 遍历
+    # 的是 OS_REG_SORTED，那张表由 registry::sort 填；表空着时每个 g: 节点都
+    # 验不过，恢复出来的栈是空的 —— 表现是从分组里进去的命令一按回车就跳回
+    # 主屏，中间那层怎么都回不去。排序在一次 scan 之内不变，全程只需这一次。
+    registry::sort
+    menu_index_tree
+    menu_stack_restore
+    menu_loop
+}
+
+main "$@"

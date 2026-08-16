@@ -1,0 +1,1 @@
+deb [arch=%%ARCH%% signed-by=%%KEYRING%%] https://download.docker.com/linux/%%OS_ID%% %%CODENAME%% stable

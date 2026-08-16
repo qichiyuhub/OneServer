@@ -1,0 +1,1 @@
+deb [signed-by=%%KEYRING%%] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main

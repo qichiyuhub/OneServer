@@ -1,0 +1,30 @@
+[Unit]
+Description=OneServer 备份任务
+Documentation=https://github.com/qichiyuhub/OneServer
+# 数据库必须先起来，否则 mysqldump 连不上。Wants 而不是 Requires：
+# MariaDB 没装的机器也可能只备份文件，不该因此让 timer 整个失败
+Wants=mariadb.service
+After=mariadb.service network-online.target
+
+[Service]
+Type=oneshot
+# --non-interactive：定时任务里没有终端，任何一个交互点卡住就是任务永远挂着。
+# 它同时保证「缺必需参数时以退出码 2 停下」而不是替用户做选择
+#
+# **这里不写 --target。** 备份哪些目标由 `oneserver backup schedule --targets=...`
+# 落在 state 里，`run` 不给 --target 时读的就是它。写死在 unit 里的话，
+# 用户改了目标清单却发现定时任务照旧备老的那几样，而且看不出为什么。
+ExecStart=/opt/oneserver/bin/oneserver backup run --non-interactive
+# 备份是 IO 密集的，别跟正在服务的站点抢磁盘
+IOSchedulingClass=idle
+Nice=10
+# 备份要读全盘、写 /var/backups、还要调 mysqldump 与 rclone，能收的沙箱选项
+# 很少 —— 但这一条是免费的：它只禁止**提权**，不限制任何读写路径。
+# 一个以 root 跑几小时、还会执行 rclone 这类外部二进制的 unit，
+# 不该让其中任何一环再拿到比它自己更高的权限。
+NoNewPrivileges=yes
+# 一次备份可能要传几个 G 到远端，别让 systemd 在中途掐掉它
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

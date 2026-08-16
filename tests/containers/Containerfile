@@ -1,0 +1,62 @@
+# OneServer 测试容器（F0.3）
+#
+# 带 systemd 的一次性系统容器。OneServer 全程依赖 systemctl —— 装服务、
+# 起服务、卸载时清理 unit —— 没有 systemd 的容器测不了这套工具的主路径，
+# 所以这里跑的是 /sbin/init 而不是某个前台进程。
+#
+# 用法（由 tests/testenv.sh 调用，一般不用手敲）：
+#   podman build --build-arg BASE=docker.io/library/debian:13 -t oneserver-testenv:debian13 .
+
+ARG BASE=docker.io/library/debian:13
+FROM ${BASE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    container=podman
+
+# 测试工具链（bats / shellcheck / shfmt）与 MariaDB 一并装进镜像：
+# 单元测试跑在这个一次性容器里，而不是跑在开发机或测试机上。
+# MariaDB 是给 lib/sql.sh 的用例当裁判的 —— 转义写得对不对，最终由数据库
+# 说了算，不由人对着规范推。没有它那几条用例只能 skip，等于没测。
+#
+# 不清 /var/lib/apt/lists：留着能让容器一起来就直接 apt-get install，
+# 省掉每次 reset 后的 apt-get update（那是「30 秒得到可用系统」的大头）。
+# 代价是镜像大一些、包索引会随时间变旧 —— 用 `testenv.sh build --pull` 刷新。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus \
+        ca-certificates curl wget gnupg \
+        procps iproute2 iputils-ping net-tools \
+        file less nano diffutils git logrotate \
+    && apt-get install -y --no-install-recommends \
+        bats shellcheck shfmt python3 \
+        mariadb-server mariadb-client \
+    && apt-get clean
+
+# Debian/Ubuntu 官方镜像的 default.target 是 graphical.target。容器里它必然
+# 起不来，systemd 会掉进 rescue.service —— 表现为 is-system-running 报
+# maintenance、0 个 failed unit，看上去像「没问题但就是不对」。先改默认目标。
+RUN systemctl set-default multi-user.target
+
+# 屏蔽容器里跑不通也用不上的 unit：内核模块、udev、tty。
+# 不屏蔽的话 systemd 启动会卡在这些 unit 上，is-system-running 迟迟不返回。
+# 注意不要连 graphical.target 一起屏蔽 —— 上面改完默认目标后它已经没人拉，
+# 屏蔽它反而会在 set-default 失效时把故障现象藏起来。
+RUN systemctl mask \
+    systemd-udevd.service \
+    systemd-udevd-kernel.socket \
+    systemd-udevd-control.socket \
+    systemd-modules-load.service \
+    sys-kernel-config.mount \
+    sys-kernel-debug.mount \
+    sys-kernel-tracing.mount \
+    getty.target
+
+# Debian/Ubuntu 官方镜像自带一个返回 101 的 /usr/sbin/policy-rc.d，专门阻止
+# 包安装时自动启动服务。留着它，`apt-get install nginx` 后服务是 inactive，
+# 而真实 VPS 上是 active —— 幂等性、前置检查这类测试会得出与生产相反的结论。
+RUN printf '#!/bin/sh\nexit 0\n' >/usr/sbin/policy-rc.d \
+    && chmod 0755 /usr/sbin/policy-rc.d
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

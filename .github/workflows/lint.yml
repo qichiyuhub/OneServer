@@ -1,0 +1,92 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['VERSION']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: shellcheck + shfmt
+    # 反例自检要把工作区复制若干份、每份跑一遍完整 lint，比正例慢得多
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    steps:
+      # 全历史：lint 的「接口变了就得升 API_VERSION」要跟改动前的那个 commit
+      # 比。浅克隆下那个 commit 不在本地，检查只能跳过。
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 安装 shellcheck、shfmt 与 zsh
+        run: |
+          v=$(sed -nE "s/^readonly EXPECT_SHELLCHECK_VERSION='([0-9.]+)'.*/\1/p" tests/lint.sh)
+          [ -n "${v}" ] || { echo "从 tests/lint.sh 读不到 EXPECT_SHELLCHECK_VERSION"; exit 1; }
+          sum=$(sed -nE "s/^readonly EXPECT_SHELLCHECK_SHA256='([0-9a-f]{64})'.*/\1/p" tests/lint.sh)
+          [ -n "${sum}" ] || { echo "从 tests/lint.sh 读不到 EXPECT_SHELLCHECK_SHA256"; exit 1; }
+          # 先落地再校验再解包，**不用管道直灌 tar**：无校验地下载并执行的
+          # 会是执行本仓库全部安全门禁的那个二进制（规范 §11 同样管得到它）
+          curl -fsSL --proto '=https' --proto-redir '=https' \
+            -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${v}/shellcheck-v${v}.linux.x86_64.tar.xz"
+          echo "${sum}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          sudo install -m 0755 "shellcheck-v${v}/shellcheck" /usr/local/bin/shellcheck
+          sudo apt-get update -qq
+          # zsh 只用来 `zsh -n` 查 zsh 补全的语法：本机可以没有，CI 上不能没有，
+          # 否则那份脚本又回到「一项检查都过不到」的状态
+          sudo apt-get install -y -qq shfmt zsh
+          shellcheck --version
+          shfmt --version
+          zsh --version
+
+      # 检出之后工作区就是 HEAD，自己跟自己比永远「无变动」。基准必须显式给：
+      # PR 比目标分支，push 比推送前的 SHA。手动触发时给不出，lint 会说明并跳过。
+      - name: 静态检查
+        env:
+          OS_LINT_API_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: bash tests/lint.sh
+
+      # 正例证明不了检查还活着：这个项目出过一条「一直绿、从没拦下过任何东西」
+      # 的检查。反例自检给每条规则喂一段确定违规的代码，要求它必须红。
+      - name: 反例自检
+        run: bash tests/lint-selftest.sh
+
+  unit:
+    name: ${{ matrix.distro }} 隔离测试
+    runs-on: ubuntu-24.04
+    # 只当兜底：job 超时会被标成 cancelled 而拿不到日志，让 step 超时先触发
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian13, ubuntu2404, ubuntu2604]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Podman
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman
+          podman --version
+
+      - name: 创建干净 systemd 容器
+        run: sudo -E bash tests/testenv.sh reset "${{ matrix.distro }}"
+
+      - name: 运行 lib 单元测试
+        run: sudo -E bash tests/testenv.sh exec "${{ matrix.distro }}" bash -c 'cd /src && bats tests/lib'
+
+      - name: 验证安装与全部命令 smoke
+        run: |
+          sudo -E bash tests/testenv.sh exec "${{ matrix.distro }}" bash -c '
+            git config --global --add safe.directory /src
+            cd /src
+            bash packaging/make-manifest.sh /tmp/oneserver-manifest.txt
+            bash install.sh --manifest=/tmp/oneserver-manifest.txt --from=/src --yes
+            bash tests/smoke.sh
+          '

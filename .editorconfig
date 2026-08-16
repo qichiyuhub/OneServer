@@ -1,0 +1,39 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# shfmt 原生读取 EditorConfig，这两节是 shell 格式化的唯一真相源。
+#
+# bin/ 要单列：EditorConfig 按**文件名**匹配，而两个前端没有扩展名，
+# `*.{sh,bash}` 匹配不到它们 —— 漏了这一节，它们只吃到 [*] 的缩进设置，
+# 拿不到 shell_variant 与换行规则，格式会和其余脚本不一致。
+[*.{sh,bash}]
+shell_variant = bash
+binary_next_line = true
+switch_case_indent = true
+space_redirects = false
+keep_padding = false
+function_next_line = false
+
+[bin/*]
+shell_variant = bash
+binary_next_line = true
+switch_case_indent = true
+space_redirects = false
+keep_padding = false
+function_next_line = false
+
+[*.{yml,yaml,json}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+[*.md]
+trim_trailing_whitespace = false

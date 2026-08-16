@@ -1,0 +1,15 @@
+[Unit]
+Description=OneServer 定时备份
+Documentation=https://github.com/qichiyuhub/OneServer
+
+[Timer]
+OnCalendar=%%ONCALENDAR%%
+# 机器关机错过的那次，开机后补跑 —— 家用/小型 VPS 常有关机时段，
+# 不补的话「每天备份」实际变成「开着机的那些天备份」
+Persistent=true
+# 全网同一时刻一起往对象存储推是自找限流；散开最多 30 分钟
+RandomizedDelaySec=1800
+Unit=oneserver-backup.service
+
+[Install]
+WantedBy=timers.target

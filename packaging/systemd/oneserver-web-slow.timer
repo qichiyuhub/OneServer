@@ -1,0 +1,18 @@
+[Unit]
+Description=OneServer 面板慢档采集定时器
+Documentation=https://github.com/qichiyuhub/OneServer
+
+[Timer]
+# 秒级节奏用 OnUnitActiveSec 而不是 OnCalendar：OnCalendar 的最小粒度是秒，
+# 但它对齐的是墙钟，一堆 unit 会挤在同一秒被唤醒
+# 同快档：OnActiveSec 让慢档在启用后 20 秒补一轮完整数据，
+# 而不是让用户对着不全的组件清单等满 5 分钟
+OnActiveSec=20
+OnUnitActiveSec=300
+# **不要 Persistent**：错过的那次快档没有任何补跑价值 —— 它采的是「此刻」，
+# 补跑一个十分钟前的「此刻」只会往快照里写过期数据
+AccuracySec=30s
+Unit=oneserver-web-slow.service
+
+[Install]
+WantedBy=timers.target

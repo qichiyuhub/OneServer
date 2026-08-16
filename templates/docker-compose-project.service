@@ -1,0 +1,34 @@
+# 由 oneserver docker compose 生成 —— 不要手改，下次 up 会按模板重新渲染并覆盖。
+#
+# 为什么 compose 项目要包一层 systemd（同 D196 的理由）：`docker compose up -d`
+# 起的容器重启机器后会不会自己回来，完全取决于用户 compose 文件里写没写
+# restart:，而本工具不改用户的 compose 文件（D198）。包一层 systemd 之后，
+# 开机自启、依赖顺序、失败处理都不再依赖 compose 文件本身怎么写。
+#
+# 项目的真相在 %%DIR%% 那个目录里 —— 本工具不复制、不改写它的任何文件。
+
+[Unit]
+Description=Compose 项目 %%NAME%%（oneserver 托管）
+Documentation=https://docs.docker.com/compose/
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%%DIR%%
+
+ExecStart=%%DOCKER%% compose -f %%FILE%% -p %%NAME%% up -d
+
+# ExecStop 是 stop 不是 down（同 D197 的理由）：systemctl restart 会触发
+# ExecStop → ExecStart，用 down 则每次重启都删掉容器与匿名卷 ——
+# restart 一次就丢数据。要真正删容器走 oneserver docker compose down。
+ExecStop=%%DOCKER%% compose -f %%FILE%% -p %%NAME%% stop
+
+# 第一次 up 要拉镜像，900 秒是给它的
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

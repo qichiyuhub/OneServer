@@ -1,0 +1,10 @@
+// /etc/apt/apt.conf.d/20auto-upgrades
+//
+// 由 `oneserver safe updates` 落地。两行的含义：
+//   Update-Package-Lists  每天 apt-get update
+//   Unattended-Upgrade    每天装安全更新（装哪些源由 50unattended-upgrades 决定，
+//                         发行版出厂就只开安全源，本工具不改它）
+//
+// 关掉自动更新：把值改成 "0"，或删掉本文件。
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

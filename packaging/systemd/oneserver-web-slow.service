@@ -1,0 +1,50 @@
+[Unit]
+Description=OneServer 面板慢档采集
+Documentation=file:///opt/oneserver/docs/TECHNICAL_SPEC.md
+# 装包时不要跑：apt 正忙的时候采到的是半装状态，虽然下一轮会自愈，
+# 但没必要在明知会脏的时刻去采
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/oneserver/script/ops/web_collect.sh --tier=slow --non-interactive
+# 采集器是 root-nolock，禁止一切副作用，所以历史的盘上副本由这个持锁的步骤刷。
+# 跟慢档而不是快档：跟快档就是每 30 秒重写一次 99 KB
+ExecStartPost=/opt/oneserver/script/ops/web_persist.sh --non-interactive
+
+# 采集器不持全局锁（@privilege root-nolock），因此**必须**自己保证不重叠：
+# 同一个 unit 的实例天然串行，systemd 会跳过还在跑的那次触发。
+# 别把它改成 Type=simple 或加 RemainAfterExit——那会让下一次触发被永久跳过。
+
+# 只读探测不该有能力改系统。这不是洁癖：这个 unit 每 10 秒以 root 跑一次，
+# 是机器上最频繁的 root 入口，值得把能收的权限都收掉。
+#
+# **ProtectSystem 只能到 full，不能用 strict**：strict 把整个文件系统挂成
+# 只读，podman 连自己的运行时状态都访问不了，`podman ps` 直接失败 ——
+# 现场表现是面板上容器数永远是 0，而手动跑同一条命令一切正常。
+# 实测（systemd-run 逐项验证）：strict 挂，full 与 PrivateTmp 都没问题。
+# 硬化选项必须挨个实测，照抄模板会把功能悄悄弄坏。
+ProtectSystem=full
+# 数据目录在 tmpfs 上（规范 §4.2）；data 那条是给历史曲线的盘上副本用的。
+# **不写成 /opt/oneserver**：那样这个每 5 分钟以 root 跑一次的 unit 就能改
+# secure.conf 与 lib/ 了，而它只需要写一个文件
+ReadWritePaths=/run/oneserver-public /opt/oneserver/data
+# 数据目录在 tmpfs 上，重启即空，必须由 systemd 在挂命名空间之前建回来 ——
+# 三行缺一不可，理由见 fast 那份的说明
+RuntimeDirectory=oneserver-public
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+# **read-only 而不是 yes**：yes 会把 /root 整个藏掉，于是
+# probe::ssh_authkeys 读不到 /root/.ssh/authorized_keys，面板上「root 公钥数」
+# 永远是 0 —— 而那个数字正是「能不能安全地关掉密码登录」的依据，
+# 报 0 会把人引向一个能把自己锁在门外的判断。实测：yes 读不到，read-only 读得到。
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# 采一轮慢档要跑 apt-cache policy 等慢查询。给 30 秒是留给「systemctl 卡在某个
+# 挂死的 unit 上」这类情况，超时就放弃这一轮，下一轮自愈
+TimeoutStartSec=180

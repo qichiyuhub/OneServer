@@ -1,0 +1,20 @@
+[Unit]
+Description=OneServer 面板快档采集定时器
+Documentation=https://github.com/qichiyuhub/OneServer
+
+[Timer]
+# 秒级节奏用 OnUnitActiveSec 而不是 OnCalendar：OnCalendar 的最小粒度是秒，
+# 但它对齐的是墙钟，一堆 unit 会挤在同一秒被唤醒
+# **OnActiveSec 而不是 OnBootSec**：后者相对系统启动，机器已经开了三天时
+# 它是个早就过去的时刻，语义含糊；这里要的是「timer 一被启用就尽快开始」。
+# 也给了 enable 里的首轮采集一个补正机会 —— 那一轮跑在框架把 unit 写进
+# state 之前（登记发生在命令退出的 EXIT 钩子里），采到的组件资源是不全的。
+OnActiveSec=5
+OnUnitActiveSec=30
+# **不要 Persistent**：错过的那次快档没有任何补跑价值 —— 它采的是「此刻」，
+# 补跑一个十分钟前的「此刻」只会往快照里写过期数据
+AccuracySec=1s
+Unit=oneserver-web-fast.service
+
+[Install]
+WantedBy=timers.target

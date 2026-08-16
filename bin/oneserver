@@ -1,0 +1,281 @@
+#!/bin/bash
+#
+# OneServer 唯一入口 —— 命令路由前端
+#
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH
+umask 027
+
+# shellcheck disable=SC2034  # 理由：由 bootstrap.sh 读取，而那是运行期绝对路径，shellcheck 跟不进去
+OS_BOOT_MODE=frontend
+source /opt/oneserver/lib/bootstrap.sh
+source /opt/oneserver/lib/registry.sh
+
+# ------------------------------------------------------------------
+# 这个文件里**不许出现任何具体命令名**（`menu` 除外，它是前端自己）。
+# 命令表来自注册表，注册表来自脚本的元数据头 —— 新增功能 = 放一个文件，
+# 本文件应保持零命令特例；命令由注册表统一发现。
+
+OS_CLI_VERSION=''
+OS_CLI_API=''
+
+read_versions() {
+    OS_CLI_VERSION='未知'
+    OS_CLI_API='未知'
+    if [[ -r ${OS_VERSION_FILE} ]]; then
+        IFS= read -r OS_CLI_VERSION <"${OS_VERSION_FILE}" || true
+    fi
+    if [[ -r ${OS_API_VERSION_FILE} ]]; then
+        IFS= read -r OS_CLI_API <"${OS_API_VERSION_FILE}" || true
+    fi
+    return 0
+}
+
+usage() {
+    read_versions
+    os::section "OneServer ${OS_CLI_VERSION}"
+    os::kv \
+        '用法' 'oneserver <命令> [子命令] [参数...]' \
+        '菜单' 'oneserver menu（或直接敲 oneserver / os）' \
+        '补全' 'oneserver completion bash > /etc/bash_completion.d/oneserver' \
+        'lib API' "${OS_CLI_API}"
+
+    registry::sort
+    local last_group='' gname
+    local -a pairs=()
+    local -i i idx
+    for ((i = 0; i < ${#OS_REG_SORTED[@]}; i++)); do
+        idx=${OS_REG_SORTED[i]}
+        if [[ ${OS_REG_GROUP[idx]} != "${last_group}" ]]; then
+            # 攒一组打一次：os::kv 的对齐是按一次调用里的键算的，
+            # 一条一调的话每行各对各的，列就散了
+            if [[ ${#pairs[@]} -gt 0 ]]; then
+                os::kv "${pairs[@]}"
+                pairs=()
+            fi
+            last_group=${OS_REG_GROUP[idx]}
+            gname=$(registry::group_name "${last_group}")
+            os::section "${gname}"
+        fi
+        pairs+=("${OS_REG_COMMAND[idx]}" "${OS_REG_DESC[idx]}")
+    done
+    if [[ ${#pairs[@]} -gt 0 ]]; then
+        os::kv "${pairs[@]}"
+    fi
+
+    os::section '全局参数'
+    os::kv \
+        '--help' '显示帮助（跟在具体命令后面则是那条命令的帮助）' \
+        '--dry-run' '预演，不产生变更' \
+        '--non-interactive' '所有交互点取默认值' \
+        '--yes' '所有确认点视为「是」（对删除类操作不生效）' \
+        '--output <fmt>' 'text（默认）或 json' \
+        '--no-color' '强制关闭颜色'
+    return 0
+}
+
+version() {
+    read_versions
+    os::kv 'oneserver' "${OS_CLI_VERSION}" 'lib API' "${OS_CLI_API}"
+    return 0
+}
+
+# 未知命令时，把首词相同的命令列出来。比「未知命令，请看 --help」有用得多：
+# 绝大多数错法是 `oneserver install php8.3` 这种记错了子命令的
+suggest() {
+    local first=${1-}
+    local -a pairs=()
+    local -i i
+    for ((i = 0; i < OS_REG_COUNT; i++)); do
+        if [[ ${OS_REG_COMMAND[i]} == "${first}"* ]]; then
+            pairs+=("oneserver ${OS_REG_COMMAND[i]}" "${OS_REG_DESC[i]}")
+        fi
+    done
+    [[ ${#pairs[@]} -gt 0 ]] || return 0
+    os::section '你是不是想用'
+    os::kv "${pairs[@]}"
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 补全
+#
+# **动态而不是静态快照**：补全脚本每次按 Tab 都回头问 `oneserver __complete`，
+# 候选因此永远等于当前注册表。静态快照要在「装了新脚本」之后重新生成，
+# 而没人会记得 —— 补全悄悄是旧的，正好抵消掉 D8「新增功能 = 放一个文件」。
+# 代价是一次扫描（20–40ms），在 Tab 补全里察觉不到。
+
+OS_CLI_GLOBAL_FLAGS='--help
+--dry-run
+--non-interactive
+--yes
+--verbose
+--output
+--no-color
+--force-destroy'
+
+# 从 @args 里抽出参数名。`--version=<ver>` 与 `[--with-fpm]` 都只取 `--version` / `--with-fpm`
+args_flags() {
+    local spec=${1-}
+    [[ -n ${spec} ]] || return 0
+    local tok
+    local IFS=$' \t'
+    for tok in ${spec}; do
+        tok=${tok#[}
+        tok=${tok%]}
+        tok=${tok%%=*}
+        if [[ ${tok} == --* ]]; then
+            printf '%s\n' "${tok}"
+        fi
+    done
+    return 0
+}
+
+# oneserver __complete [已输入的完整词...]   打印**下一个词**的候选，一行一个。
+# 过滤前缀的事交给 compgen / compadd，这里只管给全集。
+complete_candidates() {
+    local -a typed=()
+    local a
+    for a in "$@"; do
+        # 选项不参与命令路径匹配：`oneserver firewall --dry-run <Tab>`
+        # 补的仍然是 firewall 这条命令的东西
+        if [[ ${a} != -* ]]; then
+            typed+=("${a}")
+        fi
+    done
+
+    local IFS=' '
+    local -i n=${#typed[@]}
+
+    # 1) 已输入的词正好构成一条完整命令 → 补它的 @args 与全局参数
+    if ((n > 0)) && registry::resolve "${typed[@]}"; then
+        if ((OS_REG_MATCH_WORDS == n)); then
+            args_flags "${OS_REG_ARGS[OS_REG_MATCH]}"
+            printf '%s\n' "${OS_CLI_GLOBAL_FLAGS}"
+            return 0
+        fi
+    fi
+
+    # 2) 否则补下一个命令词
+    local prefix="${typed[*]}"
+    local seen='' cmd next
+    local -i i
+    for ((i = 0; i < OS_REG_COUNT; i++)); do
+        cmd=${OS_REG_COMMAND[i]}
+        if ((n == 0)); then
+            next=${cmd%% *}
+        elif [[ ${cmd} == "${prefix} "* ]]; then
+            next=${cmd#"${prefix} "}
+            next=${next%% *}
+        else
+            continue
+        fi
+        # 同一个首词会被多条命令共享（install php / install caddy），去重
+        if [[ ${seen} == *"|${next}|"* ]]; then
+            continue
+        fi
+        seen+="|${next}|"
+        printf '%s\n' "${next}"
+    done
+
+    if ((n == 0)); then
+        printf 'menu\ncompletion\n--version\n'
+        printf '%s\n' "${OS_CLI_GLOBAL_FLAGS}"
+    fi
+    return 0
+}
+
+# oneserver completion <bash|zsh>   把补全脚本打到 stdout
+#
+# 打印而不是写文件：前端零副作用，装到哪里由用户决定 ——
+#   oneserver completion bash > /etc/bash_completion.d/oneserver
+emit_completion() {
+    local shell=${1-}
+    local file="${OS_ROOT}/packaging/completion/oneserver.${shell}"
+    case ${shell} in
+        bash | zsh) ;;
+        *) os::die 2 '用法：oneserver completion <bash|zsh>' ;;
+    esac
+    if [[ ! -r ${file} ]]; then
+        os::die 4 "补全脚本缺失：${file}"
+    fi
+    local line
+    while IFS= read -r line || [[ -n ${line} ]]; do
+        printf '%s\n' "${line}"
+    done <"${file}"
+    return 0
+}
+
+# 菜单是前端的一部分，不是注册表里的命令 —— 它若进注册表就会出现在自己的列表里
+dispatch_menu() {
+    local menu="${OS_BIN_DIR}/oneserver-menu"
+    if [[ ! -x ${menu} ]]; then
+        os::die 4 "菜单前端不可执行：${menu}"
+    fi
+    log::write debug "派发到菜单 ${menu}" framework
+    # exec 换进程映像，不 fork 后等待（K13）
+    exec "${menu}" "$@"
+}
+
+main() {
+    registry::groups_load
+    registry::scan
+
+    # 无参数 = 进菜单。`os` 是本文件的符号链接，行为完全一致（Q3）——
+    # 敲 os 进菜单的肌肉记忆保住了，又不必维护两套语义
+    if [[ $# -eq 0 ]]; then
+        dispatch_menu
+    fi
+
+    case ${1} in
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        --version | -V)
+            version
+            exit 0
+            ;;
+        menu)
+            shift
+            dispatch_menu "$@"
+            ;;
+        completion)
+            shift
+            emit_completion "${1-}"
+            exit 0
+            ;;
+        __complete)
+            # 补全脚本按 Tab 时调的内部入口，不出现在 --help 里
+            shift
+            complete_candidates "$@"
+            exit 0
+            ;;
+    esac
+
+    if ! registry::resolve "$@"; then
+        # 文件头把 IFS 设成了 $'\n\t'，"$*" 会用换行连接 ——
+        # 报错信息会散成两行，看着像是两条错误
+        local IFS=' '
+        os::err "未知命令：$*"
+        suggest "${1}"
+        os::info '全部命令：oneserver --help'
+        exit 2
+    fi
+
+    local file=${OS_REG_FILE[OS_REG_MATCH]}
+    if [[ ! -x ${file} ]]; then
+        os::die 4 "命令脚本没有执行位：${file}"
+    fi
+    shift "${OS_REG_MATCH_WORDS}"
+
+    log::write info "路由：${OS_REG_COMMAND[OS_REG_MATCH]} → ${file}" framework
+    # 规范 / D14：必须 exec。常驻的父进程在文件被替换后会从旧偏移量
+    # 继续读一个内容已变的文件，以 root 执行错乱的字节（K13）
+    exec "${file}" "$@"
+}
+
+main "$@"

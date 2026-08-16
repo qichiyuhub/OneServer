@@ -1,0 +1,40 @@
+# OneServer · shellcheck 配置
+#
+# disable 审计由 tests/lint.sh 第 3 项执行，两条通道分开管：
+#   - 文件内每个 `# shellcheck disable=` 必须紧跟 `# 理由：...`，总数守棘轮
+#     （只降不升，清理一批才能往下调）
+#   - **本文件里的全局禁用走精确允许列表**，不是阈值。一条全局禁用关掉的是
+#     所有文件的那条规则，往这儿加一行曾经是全项目最省事、也最不会被发现的
+#     消警告手段。现在要加就得同时改 lint.sh 的 ALLOWED_GLOBAL_DISABLES，
+#     而改那里必然被 review 看见。
+#
+# 全局禁用：1 条，理由见下。
+
+shell=bash
+
+# SC1091「Not following: ... does not exist」
+#
+# 规范要求每个脚本以 `source /opt/oneserver/lib/bootstrap.sh` 开头 —— 那是
+# **运行期**的绝对路径，仓库里永远不存在，shellcheck 永远跟不进去。
+#
+# 不全局关掉的话，每个 source 了 bootstrap 的脚本都要写一次
+# `# shellcheck source=/dev/null` —— 四十多条，全部内容相同、全部没有信息量，
+# 而棘轮记的正是「还欠多少条待清理的豁免」。一个「每个文件都必须写、写了也
+# 没人会看」的 disable，正是那条防刷规则要防的东西。
+#
+# 代价：source 一个真不存在的文件不会再被静态检查发现。可接受 ——
+# bootstrap.sh 缺失在运行时第一行就炸，不是需要静态分析才能发现的问题。
+disable=SC1091
+
+# lib/ 之间用变量路径 source（`source "${OS_LIB_DIR}/log.sh"`），
+# 不开这两项 shellcheck 无法跟进被 source 的文件，会误报大量 SC2154（变量未赋值）。
+external-sources=true
+source-path=SCRIPTDIR
+source-path=lib
+
+# --- 主动加严的可选检查 ---
+# 默认关闭，但与本项目「零告警」目标一致，提前打开好过将来批量返工。
+enable=require-variable-braces
+enable=quote-safe-variables
+enable=deprecate-which
+enable=avoid-nullary-conditions

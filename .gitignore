@@ -1,0 +1,43 @@
+# --- 密钥与凭据：绝不入库 ---
+*.key
+*.pem
+*.sec
+minisign.*
+secure.conf
+
+# --- 构建与分发产物 ---
+/dist/
+/build/
+# manifest.txt 是**发布产物，不入库**：它记的 commit 只有在生成之后才存在，
+# 提交它必然产生「清单里的 commit 不是本次 commit」的自相矛盾。
+# 发布流程是 tag → 生成 → 作为 Release 资产上传。
+/manifest.txt
+manifest.txt.sig
+manifest.txt.minisig
+
+# --- 内部工程文档：本地保留，不入库 ---
+# AI 协作指令，以及面向维护者的开发流程。
+/AGENTS.md
+/CLAUDE.md
+/docs/PROJECT_GUIDE.md
+/docs/WORKFLOW.md
+
+# --- 测试运行产物 ---
+/tests/.tmp/
+/tests/**/*.out
+/tests/**/*.log
+
+# --- 备份与临时文件 ---
+*.bak
+*.orig
+*.rej
+*.tmp
+*.swp
+*~
+
+# --- 编辑器与操作系统 ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

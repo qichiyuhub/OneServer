@@ -1,0 +1,34 @@
+[Unit]
+Description=OneServer 面板实时档采集
+Documentation=file:///opt/oneserver/docs/TECHNICAL_SPEC.md
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/oneserver/script/ops/web_collect.sh --tier=live --non-interactive
+
+# 这一档**只读 /proc**，一个外部进程都不起（probe::_probe_proc 走 bash 内建），
+# 所以硬化可以比另外两档更狠：整个文件系统只读，只留该写的两个目录。
+# 另外两档做不到 strict 是因为 podman 要访问自己的运行时状态（见 fast 那份的
+# 说明）——这一档根本不碰容器，那条限制不适用。
+#
+# **日志目录不能漏**：strict 会把 /var 一起锁成只读，而框架的日志初始化
+# 打不开文件时是**静默降级**的（那个降级本身是对的，见 log.sh 里 K16 那段）。
+# 漏了它的表现不是报错，是这一档从此一行日志都没有 —— 真出问题时零线索。
+# 实测：只放开数据目录时写 0 行，加上这一条写 12 行。
+ProtectSystem=strict
+ReadWritePaths=/run/oneserver-public /var/log/oneserver
+# 数据目录在 tmpfs 上，重启即空，必须由 systemd 在挂命名空间之前建回来 ——
+# 三行缺一不可，理由见 fast 那份的说明
+RuntimeDirectory=oneserver-public
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# 一轮实测不到 20 毫秒。给 10 秒纯粹是兜底，超时就放弃这一轮，下一轮自愈
+TimeoutStartSec=10

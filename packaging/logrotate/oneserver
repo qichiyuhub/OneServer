@@ -1,0 +1,45 @@
+# OneServer 日志轮转
+# 安装位置：/etc/logrotate.d/oneserver
+#
+# 三类落点分开管：主日志与按命令分的文件可以正常压缩；JSONL 是给
+# 只读面板与 grep 直接读的，压缩后就要先解压才能查，因此多留几份不压缩的。
+# 审计日志是事故追溯用的，留得更久。
+
+/var/log/oneserver/audit.log {
+    weekly
+    rotate 26
+    maxsize 10M
+    compress
+    delaycompress
+    # 先匹配审计日志，并让后面的 *.log 忽略这个已匹配路径；否则 logrotate
+    # 会把同一个文件视为重复条目，整份配置以非零退出。
+    ignoreduplicates
+    missingok
+    notifempty
+    create 0640 root root
+    su root root
+}
+
+/var/log/oneserver/*.log {
+    daily
+    rotate 14
+    maxsize 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    su root root
+}
+
+/var/log/oneserver/oneserver.jsonl {
+    daily
+    rotate 14
+    maxsize 20M
+    # 不压缩：这是查询用的结构化日志，压了就得先解压才能 grep
+    nocompress
+    missingok
+    notifempty
+    create 0640 root root
+    su root root
+}
