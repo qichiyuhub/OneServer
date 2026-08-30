@@ -7,10 +7,10 @@
 #
 # 两种运行模式，自动判断：
 #   本地  宿主上有 podman            —— 直接跑
-#   远程  没有 podman（如 Windows）  —— 把工作区同步到 ${TESTENV_HOST} 后经 ssh 执行
+#   远程  宿主上没有 podman         —— 把工作区同步到 ${TESTENV_HOST} 后经 ssh 执行
 #
 # 环境变量：
-#   TESTENV_HOST        远程宿主（默认 myrule-validator）
+#   TESTENV_HOST        远程宿主（默认 debian）
 #   TESTENV_REMOTE_SRC  远程工作区路径（默认 /root/oneserver-src）
 #   TESTENV_LOCAL=1     强制本地模式，不做远程转发
 #
@@ -27,7 +27,7 @@ readonly CTR_PREFIX="oneserver-test"
 # 数组而非空格分隔字符串：上面把 IFS 设成了 $'\n\t'，字符串在 for 里不按空格分词
 declare -ra DISTROS=(debian13 ubuntu2404 ubuntu2604)
 
-TESTENV_HOST="${TESTENV_HOST:-myrule-validator}"
+TESTENV_HOST="${TESTENV_HOST:-debian}"
 TESTENV_REMOTE_SRC="${TESTENV_REMOTE_SRC:-/root/oneserver-src}"
 
 # --- 输出 ---
@@ -58,7 +58,7 @@ ctr_of() { printf '%s\n' "${CTR_PREFIX}-${1}"; }
 # --- 远程转发 ---
 #
 # 没有 podman 就把整个工作区打包送到 TESTENV_HOST，再在那边用同一份脚本执行。
-# 用 tar 而不是 rsync：Git Bash 自带 tar，不带 rsync。
+# 用 tar 而不是 rsync：rsync 要两端都装，而 tar 在任何 Debian/Ubuntu 上都在。
 
 sync_src() {
     local dst

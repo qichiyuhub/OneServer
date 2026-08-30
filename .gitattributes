@@ -1,0 +1,9 @@
+# 分发物是 bash 脚本，带 \r 的脚本在服务器上直接跑不起来（`#!/bin/bash^M`
+# 找不到解释器），而这个错误只在用户机器上才现形。仓库里一律 LF，不随
+# 检出平台变。
+* text=auto eol=lf
+
+# 二进制与图片不做行尾转换
+*.png binary
+*.jpg binary
+*.gz  binary

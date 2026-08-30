@@ -253,8 +253,9 @@ verify_staging() {
     # **属主也要校正，不只是权限。** 走 codeload 那条路时 tar 带
     # `--no-same-owner`，解出来就是 root；但 `--from=<目录>` 是 `cp -a`，属主
     # 原样继承自源目录。一次成功的切换会把整棵**以 root 执行**的程序树装成非
-    # root 属主（实测同步自 Windows 的源码目录解出来是 UNKNOWN:UNKNOWN），
-    # 而注册表随后照常扫描并以 root 派发其中每一个脚本。
+    # root 属主（`--from` 指向的开发同步目录，属主往往不是 root，源机器上的
+    # uid 在这台机器上甚至没有对应用户），而注册表随后照常扫描并以 root
+    # 派发其中每一个脚本。
     # 整棵 staging 一次 chown，不逐个：清单外的文件在下一步才被清掉，
     # 而它们此刻同样不该属于别人。
     os::run '校正暂存区属主' -- chown -R root:root -- "${STAGING}"

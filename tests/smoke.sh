@@ -45,8 +45,8 @@ for command in "${commands[@]}"; do
     esac
 done
 
-# 校验安装后的真实权限与路径；Windows/WSL 的只读源码挂载可能把源文件呈现为
-# 0777，logrotate 会在解析内容前先拒绝它，测不到分发真正落地的 0644 文件。
+# 校验安装后的真实权限与路径；只读源码挂载可能把源文件呈现为 0777，
+# logrotate 会在解析内容前先拒绝它，测不到分发真正落地的 0644 文件。
 logrotate --debug /etc/logrotate.d/oneserver >/dev/null
 
 printf 'smoke: %d 条命令的安装、发现、帮助、dry-run 与退出码契约均可达\n' "${#commands[@]}"

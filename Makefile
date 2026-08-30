@@ -1,6 +1,6 @@
 # OneServer 开发任务入口
 #
-# 这份 Makefile 面向 Linux 与 CI。Windows 上没有 make —— 直接调底下的脚本：
+# 这份 Makefile 面向 Linux 与 CI，只是个入口。没装 make 的环境直接调底下的脚本：
 #   bash tests/testenv.sh reset debian13
 #
 # 目标里一律不写实现，只转调 tests/ 下的脚本，避免同一段逻辑有两个版本。
