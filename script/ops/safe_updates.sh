@@ -99,7 +99,28 @@ main() {
         fi
         os::info '看它都干了什么：less /var/log/unattended-upgrades/unattended-upgrades.log'
     else
-        os::info '已跳过自动安全更新'
+        # 这里选 n 只是「本次不动它」，不是关闭 —— 本命令只做正向收敛。
+        # 已经开过一次的人在这里选 n 是想关掉，不指路他只会把同一条命令
+        # 再跑一遍。
+        #
+        # **指路不能指向 uninstall。** Ubuntu 出厂就带 unattended-upgrades
+        # 和这个配置文件，两者都不归本工具登记（见上面 state 那段），卸载
+        # 只 disable 得掉 unattended-upgrades.service —— 而那是关机时的
+        # hook，每天真正执行的是 apt-daily-upgrade.timer，它只看
+        # APT::Periodic。卸完照升不误。改配置在两个发行版上都立即生效。
+        #
+        # 判据也只能是 apt 实际生效的值，不能是 state：照提示改完配置的人
+        # state 里那条记录还在，再跑一遍又会被告知「仍是开启状态」。
+        local periodic=''
+        os::query --timeout 5 -- apt-config dump APT::Periodic::Unattended-Upgrade || true
+        # 形如 `APT::Periodic::Unattended-Upgrade "1";`；没设过则整个没有输出
+        periodic=${OS_RUN_OUTPUT#*\"}
+        periodic=${periodic%%\"*}
+        if [[ -n ${periodic} && ${periodic} != 0 ]]; then
+            os::info "自动安全更新仍是开启状态；要关闭：把 ${AUTO_UPGRADES_CONF} 里的 Unattended-Upgrade 改成 \"0\""
+        else
+            os::info '已跳过自动安全更新'
+        fi
     fi
 
     probe::reboot_required
